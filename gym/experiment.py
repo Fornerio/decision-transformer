@@ -1,11 +1,14 @@
 import gym
+import highway_env
 import numpy as np
 import torch
-import wandb
+from tqdm import tqdm
+#import wandb
 
 import argparse
 import pickle
 import random
+import highway_env
 import sys
 
 from decision_transformer.evaluation.evaluate_episodes import evaluate_episode, evaluate_episode_rtg
@@ -13,7 +16,48 @@ from decision_transformer.models.decision_transformer import DecisionTransformer
 from decision_transformer.models.mlp_bc import MLPBCModel
 from decision_transformer.training.act_trainer import ActTrainer
 from decision_transformer.training.seq_trainer import SequenceTrainer
+import datetime
+import os
 
+def load_sequence(row, action_space):
+    if isinstance(action_space, gym.spaces.Discrete):
+        action_dim = action_space.n
+    else:
+        action_dim = action_space.shape[0]
+
+    one_hot_action = np.zeros(action_dim)
+
+    '''
+    Load a sequence from a row of the dataset.
+    :param row: [[state1, action1, reward1], [state2, action2, reward2], ..., [stateN, actionN, rewardN]]
+    :return: sequence: dict containing {'states': np.array([state1, state2, ..., stateT]),
+                                    'actions': np.array([action1, action2, ..., actionT]),
+                                    'rewards': np.array([reward1, reward2, ..., rewardT]),
+                                    'dones': np.array([0,0, ..., 1])} -> trivial for our case as we always have one
+                                    scene for each episode. Dones is also not used in experiments.
+                    states: np.array of shape (T, *state_dim)
+                    actions: np.array of shape (T, *action_dim)
+                    rewards: np.array of shape (T, )
+                    dones: np.array of shape (T, )
+    '''
+    
+    states = []
+    actions = []
+    rewards = []
+    for state, action, reward in row:
+        # flatten state for mlp encoder
+        states.append(state.reshape(-1))
+        one_hot_action = np.zeros(action_dim)
+        one_hot_action[action] = 1
+        actions.append(action)
+        rewards.append(reward)
+    states = np.array(states)
+    actions = np.array(actions)
+    rewards = np.array(rewards) #if not crashed else -np.array(rewards)
+    dones = np.zeros_like(rewards)
+    dones[-1] = 1
+    sequence = {'observations': states, 'actions': actions, 'rewards': rewards, 'dones': dones}
+    return sequence
 
 def discount_cumsum(x, gamma):
     discount_cumsum = np.zeros_like(x)
@@ -22,11 +66,24 @@ def discount_cumsum(x, gamma):
         discount_cumsum[t] = x[t] + gamma * discount_cumsum[t+1]
     return discount_cumsum
 
+def save_checkpoint(model, optimizer, scheduler, epoch, outputs, checkpoint_dir=r'HighwayDRL/decision_transformer/decision-transformer/saved_models/test'):
+    if not os.path.exists(checkpoint_dir):
+        os.makedirs(checkpoint_dir)
+    checkpoint_path = os.path.join(checkpoint_dir, f'checkpoint_epoch_{epoch}.pth')
+    torch.save({
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict(),
+        'time' : outputs['time/total'],
+        'eval_time': outputs['time/evaluation'],
+        'train_loss_mean': outputs['training/train_loss_mean'],
+        'train_loss_std': outputs['training/train_loss_std']}
+               , checkpoint_path)
+    print(f"Checkpoint saved to {checkpoint_path}")
 
-def experiment(
-        exp_prefix,
-        variant,
-):
+def experiment(exp_prefix, variant):
+    
     device = variant.get('device', 'cuda')
     log_to_wandb = variant.get('log_to_wandb', False)
 
@@ -35,40 +92,26 @@ def experiment(
     group_name = f'{exp_prefix}-{env_name}-{dataset}'
     exp_prefix = f'{group_name}-{random.randint(int(1e5), int(1e6) - 1)}'
 
-    if env_name == 'hopper':
-        env = gym.make('Hopper-v3')
-        max_ep_len = 1000
-        env_targets = [3600, 1800]  # evaluation conditioning targets
-        scale = 1000.  # normalization for rewards/returns
-    elif env_name == 'halfcheetah':
-        env = gym.make('HalfCheetah-v3')
-        max_ep_len = 1000
-        env_targets = [12000, 6000]
-        scale = 1000.
-    elif env_name == 'walker2d':
-        env = gym.make('Walker2d-v3')
-        max_ep_len = 1000
-        env_targets = [5000, 2500]
-        scale = 1000.
-    elif env_name == 'reacher2d':
-        from decision_transformer.envs.reacher_2d import Reacher2dEnv
-        env = Reacher2dEnv()
-        max_ep_len = 100
-        env_targets = [76, 40]
-        scale = 10.
+    if env_name == 'dm_env':
+        env = gym.make('dm-env-v0')
+        env.reset()
     else:
         raise NotImplementedError
 
     if model_type == 'bc':
         env_targets = env_targets[:1]  # since BC ignores target, no need for different evaluations
 
-    state_dim = env.observation_space.shape[0]
-    act_dim = env.action_space.shape[0]
-
     # load dataset
-    dataset_path = f'data/{env_name}-{dataset}-v2.pkl'
-    with open(dataset_path, 'rb') as f:
-        trajectories = pickle.load(f)
+    dataset_path = args.dataset
+
+    # Load sequences
+    A = np.load(dataset_path, allow_pickle=True) 
+
+    trajectories = [load_sequence(row, env.action_space) for row in A]
+    act_dim = np.squeeze(trajectories[0]['actions'].shape[1:])
+    state_dim = np.squeeze(trajectories[0]['observations'].shape[1:])
+
+    print(act_dim, state_dim)
 
     # save all path information into separate lists
     mode = variant.get('mode', 'normal')
@@ -87,18 +130,24 @@ def experiment(
     state_mean, state_std = np.mean(states, axis=0), np.std(states, axis=0) + 1e-6
 
     num_timesteps = sum(traj_lens)
+    scale = np.mean([len(path['observations']) for path in trajectories])  # scale for rtg
 
     print('=' * 50)
     print(f'Starting new experiment: {env_name} {dataset}')
+    print(f' Max episode duration: {max(traj_lens)}', f' Average episode duration: {np.mean(traj_lens)}', 'Min episode duration:', min(traj_lens))
     print(f'{len(traj_lens)} trajectories, {num_timesteps} timesteps found')
     print(f'Average return: {np.mean(returns):.2f}, std: {np.std(returns):.2f}')
     print(f'Max return: {np.max(returns):.2f}, min: {np.min(returns):.2f}')
+    print(f'Scale: {scale}')
     print('=' * 50)
 
     K = variant['K']
     batch_size = variant['batch_size']
     num_eval_episodes = variant['num_eval_episodes']
     pct_traj = variant.get('pct_traj', 1.)
+
+    max_ep_len =  max([len(path['observations']) for path in trajectories])
+    env_targets = [np.max(returns)*scale, np.mean(returns)*scale, np.min(returns)*scale]
 
     # only train on top pct_traj trajectories (for %BC experiment)
     num_timesteps = max(int(pct_traj*num_timesteps), 1)
@@ -251,7 +300,8 @@ def experiment(
             batch_size=batch_size,
             get_batch=get_batch,
             scheduler=scheduler,
-            loss_fn=lambda s_hat, a_hat, r_hat, s, a, r: torch.mean((a_hat - a)**2),
+            #loss_fn=lambda s_hat, a_hat, r_hat, s, a, r: torch.mean((a_hat - a)**2),
+            loss_fn= lambda s_hat, a_hat, r_hat, s, a, r: torch.nn.CrossEntropyLoss()(a_hat, torch.argmax(a, dim=1)),
             eval_fns=[eval_episodes(tar) for tar in env_targets],
         )
     elif model_type == 'bc':
@@ -261,47 +311,60 @@ def experiment(
             batch_size=batch_size,
             get_batch=get_batch,
             scheduler=scheduler,
-            loss_fn=lambda s_hat, a_hat, r_hat, s, a, r: torch.mean((a_hat - a)**2),
+            loss_fn= lambda s_hat, a_hat, r_hat, s, a, r: torch.nn.CrossEntropyLoss()(a_hat, torch.argmax(a, dim=1)),
             eval_fns=[eval_episodes(tar) for tar in env_targets],
         )
 
-    if log_to_wandb:
-        wandb.init(
-            name=exp_prefix,
-            group=group_name,
-            project='decision-transformer',
-            config=variant
-        )
-        # wandb.watch(model)  # wandb has some bug
+    # if log_to_wandb:
+    #     wandb.init(
+    #         name=exp_prefix,
+    #         group=group_name,
+    #         project='decision-transformer',
+    #         config=variant
+    #     )
+    #     # wandb.watch(model)  # wandb has some bug
 
-    for iter in range(variant['max_iters']):
+    for iter in tqdm(range(variant['max_iters'])):
         outputs = trainer.train_iteration(num_steps=variant['num_steps_per_iter'], iter_num=iter+1, print_logs=True)
         if log_to_wandb:
             wandb.log(outputs)
 
+            # Save checkpoint
+        if (iter + 1) % variant['checkpoint_interval'] == 0:
+            save_checkpoint(model, optimizer, scheduler, iter + 1, outputs)
+
+    # Save the model after training
+
+    current_time = datetime.datetime.now()
+    
+    model_save_path = os.path.join(variant['output_path'],current_time)
+    torch.save(model.state_dict(), model_save_path)
+    print(f"Model saved to {model_save_path}")
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--env', type=str, default='hopper')
-    parser.add_argument('--dataset', type=str, default='medium')  # medium, medium-replay, medium-expert, expert
+    parser.add_argument('--env', type=str, default='dm_env')
+    parser.add_argument('--dataset', type=str, default=r'notebooks/train_eval/50000_dataset.npy')  # path to dataset
     parser.add_argument('--mode', type=str, default='normal')  # normal for standard setting, delayed for sparse
-    parser.add_argument('--K', type=int, default=20)
+    parser.add_argument('--K', type=int, default=35)
     parser.add_argument('--pct_traj', type=float, default=1.)
     parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--model_type', type=str, default='dt')  # dt for decision transformer, bc for behavior cloning
     parser.add_argument('--embed_dim', type=int, default=128)
     parser.add_argument('--n_layer', type=int, default=3)
-    parser.add_argument('--n_head', type=int, default=1)
+    parser.add_argument('--n_head', type=int, default=4)
     parser.add_argument('--activation_function', type=str, default='relu')
     parser.add_argument('--dropout', type=float, default=0.1)
     parser.add_argument('--learning_rate', '-lr', type=float, default=1e-4)
     parser.add_argument('--weight_decay', '-wd', type=float, default=1e-4)
     parser.add_argument('--warmup_steps', type=int, default=10000)
     parser.add_argument('--num_eval_episodes', type=int, default=100)
-    parser.add_argument('--max_iters', type=int, default=10)
+    parser.add_argument('--max_iters', type=int, default=100)
     parser.add_argument('--num_steps_per_iter', type=int, default=10000)
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--log_to_wandb', '-w', type=bool, default=False)
+    parser.add_argument('--checkpoint_interval', type=int, default=2)
     
     args = parser.parse_args()
 

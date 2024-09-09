@@ -1,0 +1,2 @@
+environment,episode_num,mean_episode_duration,collisions,mean_km_travelled,overall_mean_speed,overall_mean_acceleration,overall_mean_deceleration,mean_decision_changes,mean_left_lane_changes,mean_right_lane_changes
+dm-env-v0,100,58.0,2,1.7,106.0,2.38,-4.39,6.6,0.3,0.03
