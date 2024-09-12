@@ -10,9 +10,9 @@ import numpy as np
 import torch
 from decision_transformer.models.decision_transformer import DecisionTransformer
 import pickle
-# Evaluation
 from highway_env.envs.common.evaluate import PrintMetrics
 import random
+
 
 ACTIONS_ALL = {0: 'LANE_LEFT',1: 'IDLE',2: 'LANE_RIGHT',3: 'FASTER',4: 'SLOWER'}
 metricObj = PrintMetrics()
@@ -290,8 +290,8 @@ def evaluate_model(variant):
     # print(f"Mean Return: {mean_return}")
     env.close()
 
-    csv_id = 'test'
-    metricObj.printRecap(variant['eval_output_dir'], csv_id)
+    #csv_id = 'test'
+    #metricObj.printRecap(variant['eval_output_dir'], csv_id)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
